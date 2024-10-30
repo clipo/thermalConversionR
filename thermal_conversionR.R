@@ -74,50 +74,25 @@ process_thermal_images <- function(input_dir, output_dir, methods = "all") {
     matrix(colors[floor(normalized * 255) + 1], nrow = nrow(img))
   }
   
-  # Define specification-based histogram matching function
-  match_to_specification <- function(source_img, ref_mean, ref_std, num_bins = 256) {
-    # Normalize source to [0,1]
-    src_min <- min(source_img)
-    src_max <- max(source_img)
-    src_norm <- (source_img - src_min) / (src_max - src_min)
+  match_percentile_based <- function(source_img, reference_img) {
+    # Normalize both images to [0,1] range
+    src_norm <- (source_img - min(source_img)) / (diff(range(source_img)))
+    ref_norm <- (reference_img - min(reference_img)) / (diff(range(reference_img)))
     
-    # Create target Gaussian distribution based on reference statistics
-    x <- seq(0, 1, length.out = num_bins)
-    target_hist <- dnorm(x, mean = 0.5, sd = 0.2)
-    target_hist <- target_hist / sum(target_hist)
-    target_cdf <- cumsum(target_hist)
+    # Calculate percentiles on normalized images
+    ref_percentiles <- quantile(ref_norm, probs = seq(0, 1, 0.01))
+    src_percentiles <- quantile(src_norm, probs = seq(0, 1, 0.01))
     
-    # Calculate source histogram and CDF
-    src_hist <- hist(src_norm, breaks = seq(0, 1, length.out = num_bins + 1), plot = FALSE)
-    src_cdf <- cumsum(src_hist$counts) / sum(src_hist$counts)
-    
-    # Create lookup table
-    lookup <- numeric(num_bins)
-    for (i in 1:num_bins) {
-      if (i <= length(src_cdf)) {
-        # Find closest value in target CDF
-        diff <- abs(target_cdf - src_cdf[i])
-        closest <- which.min(diff)
-        lookup[i] <- x[closest]
-      }
+    # Map normalized source to normalized reference
+    result_norm <- src_norm
+    for(i in 1:length(src_norm)) {
+      bin <- findInterval(src_norm[i], src_percentiles)
+      bin <- min(max(bin, 1), length(ref_percentiles))
+      result_norm[i] <- ref_percentiles[bin]
     }
     
-    # Apply lookup table
-    result <- source_img
-    for (i in 1:length(source_img)) {
-      # Scale value to bin index
-      bin <- floor(num_bins * (source_img[i] - src_min) / (src_max - src_min)) + 1
-      bin <- min(max(bin, 1), num_bins)
-      
-      # Apply mapping and scale back to original range
-      norm_val <- lookup[bin]
-      result[i] <- norm_val * (src_max - src_min) + src_min
-    }
-    
-    # Scale the result to match reference statistics
-    result_std <- sd(result)
-    result_mean <- mean(result)
-    result <- (result - result_mean) * (ref_std/result_std) + ref_mean
+    # Scale back to source range
+    result <- result_norm * diff(range(source_img)) + min(source_img)
     
     return(result)
   }
@@ -206,6 +181,13 @@ process_thermal_images <- function(input_dir, output_dir, methods = "all") {
   ref_mean <- NULL
   ref_std <- NULL
   
+  # Track median values
+  median_values <- data.frame(
+    frame = integer(),
+    original = numeric(),
+    matched = numeric()
+  )
+  
   for (i in seq_along(tiff_files)) {
     img_path <- tiff_files[i]
     base_name <- tools::file_path_sans_ext(basename(img_path))
@@ -218,24 +200,27 @@ process_thermal_images <- function(input_dir, output_dir, methods = "all") {
       results <- list()
       results$original <- curr_img
       
-      # Histogram Matching using specification-based approach
+      # Histogram Matching using percentile-based approach
       if ("hist_matched" %in% selected_methods) {
         if (i == 1) {
-          # Store reference statistics from first image
+          # Store first image as reference
           reference_img <- curr_img
-          ref_mean <- mean(reference_img)
-          ref_std <- sd(reference_img)
           results$hist_matched <- curr_img
         } else {
-          # Match to specification based on reference statistics
-          results$hist_matched <- match_to_specification(curr_img, ref_mean, ref_std)
+          # Match to first image using percentile matching
+          results$hist_matched <- match_percentile_based(curr_img, reference_img)
         }
         
-        # Ensure values stay within global range
-        results$hist_matched <- pmin(pmax(results$hist_matched, global_min), global_max)
+        # Track median values for this frame
+        median_values <- rbind(median_values, 
+                               data.frame(
+                                 frame = i,
+                                 original = median(curr_img),
+                                 matched = median(results$hist_matched)
+                               ))
         
         # Save histogram matched image
-        writeTIFF(results$hist_matched, 
+        writeTIFF(matrix(results$hist_matched, nrow=nrow(curr_img)),
                   file.path(output_dir, "processed", "hist_matched", 
                             paste0(base_name, "_hist_matched.tiff")),
                   bits.per.sample = 16,
@@ -306,6 +291,25 @@ process_thermal_images <- function(input_dir, output_dir, methods = "all") {
       print(e)
     })
   }
+  
+  # Create median value plot
+  png(file.path(output_dir, "comparisons", "median_values.png"),
+      width = 800, height = 400)
+  
+  plot(median_values$frame, median_values$original, 
+       type = "l", col = "blue", 
+       xlab = "Frame Number", ylab = "Median Temperature",
+       main = "Median Temperature Values Across Frames",
+       ylim = range(c(median_values$original, median_values$matched)))
+  
+  lines(median_values$frame, median_values$matched, col = "red")
+  
+  legend("topright", 
+         legend = c("Original", "Histogram Matched"),
+         col = c("blue", "red"),
+         lty = 1)
+  
+  dev.off()
   
   # Create visualization
   n_images <- length(tiff_files)
