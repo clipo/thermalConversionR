@@ -24,12 +24,35 @@ process_thermal_images <- function(input_dir, output_dir, methods = "all") {
     selected_methods <- c("original", selected_methods)
   }
   
-  if (!dir.exists(input_dir)) stop("Input directory does not exist")
-  subdirs <- c("processed", "comparisons")
-  sapply(file.path(output_dir, subdirs), dir.create, recursive = TRUE, showWarnings = FALSE)
+  # Check input directory
+  if (!dir.exists(input_dir)) {
+    stop("Input directory does not exist: ", input_dir)
+  }
   
-  tiff_files <- sort(list.files(input_dir, pattern = "\\.tiff?$", full.names = TRUE, ignore.case = TRUE))
-  if (length(tiff_files) == 0) stop("No TIFF files found")
+  # Get list of TIFF files
+  tiff_files <- list.files(input_dir, 
+                           pattern = "\\.tiff?$", 
+                           full.names = TRUE, 
+                           ignore.case = TRUE)
+  
+  # Check if any TIFF files were found
+  if (length(tiff_files) == 0) {
+    stop("No TIFF files found in directory: ", input_dir)
+  }
+  
+  # Sort files to ensure consistent processing order
+  tiff_files <- sort(tiff_files)
+  cat("Found", length(tiff_files), "TIFF files\n")
+  
+  # Create output directories
+  subdirs <- c("comparisons", "processed")
+  sapply(file.path(output_dir, subdirs), 
+         dir.create, recursive = TRUE, showWarnings = FALSE)
+  
+  # Create method-specific subdirectories
+  method_dirs <- setdiff(selected_methods, "original")
+  sapply(file.path(output_dir, "processed", method_dirs), 
+         dir.create, recursive = TRUE, showWarnings = FALSE)
   
   # Calculate global min/max
   all_mins <- all_maxs <- numeric(length(tiff_files))
@@ -70,7 +93,6 @@ process_thermal_images <- function(input_dir, output_dir, methods = "all") {
     half_size <- ceiling(3 * sigma_s)
     window_size <- 2 * half_size + 1
     
-    # Create spatial Gaussian kernel
     spatial_kernel <- matrix(0, window_size, window_size)
     for(i in 1:window_size) {
       for(j in 1:window_size) {
@@ -81,7 +103,6 @@ process_thermal_images <- function(input_dir, output_dir, methods = "all") {
     }
     spatial_kernel <- spatial_kernel / sum(spatial_kernel)
     
-    # Apply bilateral filter
     padded <- matrix(0, nrow = nrow(img_norm) + 2*half_size, 
                      ncol = ncol(img_norm) + 2*half_size)
     padded[(half_size+1):(half_size+nrow(img_norm)), 
@@ -128,14 +149,15 @@ process_thermal_images <- function(input_dir, output_dir, methods = "all") {
     return(result)
   }
   
-  # Process each image with selected methods
+  # Process each image with all methods
   all_results <- list()
   reference_img <- NULL
   hist_breaks <- seq(global_min, global_max, length.out = 100)
   
   for (i in seq_along(tiff_files)) {
     img_path <- tiff_files[i]
-    cat("Processing:", basename(img_path), "\n")
+    base_name <- tools::file_path_sans_ext(basename(img_path))
+    cat("Processing:", base_name, "\n")
     
     tryCatch({
       curr_img <- readTIFF(img_path, all = TRUE)[[1]]
@@ -168,6 +190,10 @@ process_thermal_images <- function(input_dir, output_dir, methods = "all") {
           results$hist_matched <- matched_img
           reference_img <- matched_img
         }
+        # Save histogram matched image
+        writeTIFF(results$hist_matched, 
+                  file.path(output_dir, "processed", "hist_matched", 
+                            paste0(base_name, "_hist_matched.tiff")))
       }
       
       # CLAHE
@@ -176,22 +202,38 @@ process_thermal_images <- function(input_dir, output_dir, methods = "all") {
         img_eb <- Image(scaled_img)
         clahe_img <- clahe(img_eb)
         results$clahe <- as.array(clahe_img) * (global_max - global_min) + global_min
+        # Save CLAHE image
+        writeTIFF(results$clahe, 
+                  file.path(output_dir, "processed", "clahe", 
+                            paste0(base_name, "_clahe.tiff")))
       }
       
       # MSR
       if ("msr" %in% selected_methods) {
         results$msr <- apply_msr(curr_img)
+        # Save MSR image
+        writeTIFF(results$msr, 
+                  file.path(output_dir, "processed", "msr", 
+                            paste0(base_name, "_msr.tiff")))
       }
       
       # Bilateral
       if ("bilateral" %in% selected_methods) {
         cat("Applying bilateral filter...\n")
         results$bilateral <- apply_bilateral(curr_img)
+        # Save bilateral filtered image
+        writeTIFF(results$bilateral, 
+                  file.path(output_dir, "processed", "bilateral", 
+                            paste0(base_name, "_bilateral.tiff")))
       }
       
       # LCEP
       if ("lcep" %in% selected_methods) {
         results$lcep <- apply_lcep(curr_img)
+        # Save LCEP image
+        writeTIFF(results$lcep, 
+                  file.path(output_dir, "processed", "lcep", 
+                            paste0(base_name, "_lcep.tiff")))
       }
       
       all_results[[i]] <- results
@@ -228,8 +270,9 @@ process_thermal_images <- function(input_dir, output_dir, methods = "all") {
   dev.off()
   
   cat("\nProcessing complete. Selected methods:", paste(selected_methods, collapse = ", "), "\n")
+  cat("Processed images saved in:", file.path(output_dir, "processed"), "\n")
+  cat("Comparison visualization saved in:", file.path(output_dir, "comparisons"), "\n")
 }
-
 
 process_thermal_images("./images", "./processed_images")
 
