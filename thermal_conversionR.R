@@ -1,5 +1,6 @@
 library(tiff)
 library(EBImage)
+library(OpenImageR)
 library(grid)
 
 process_thermal_images <- function(input_dir, output_dir, methods = "all") {
@@ -54,16 +55,17 @@ process_thermal_images <- function(input_dir, output_dir, methods = "all") {
   sapply(file.path(output_dir, "processed", method_dirs), 
          dir.create, recursive = TRUE, showWarnings = FALSE)
   
-  # Calculate global min/max
+  # Calculate global min/max with proper handling of signed integers
   all_mins <- all_maxs <- numeric(length(tiff_files))
   for (i in seq_along(tiff_files)) {
-    img <- readTIFF(tiff_files[i], all = TRUE)[[1]]
+    img <- readTIFF(tiff_files[i], all = TRUE, native = TRUE)[[1]]
     all_mins[i] <- min(img, na.rm = TRUE)
     all_maxs[i] <- max(img, na.rm = TRUE)
   }
   global_min <- min(all_mins)
   global_max <- max(all_maxs)
   
+  # Helper function for thermal colorization
   colorize_thermal <- function(img) {
     normalized <- (img - global_min) / (global_max - global_min)
     normalized[normalized < 0] <- 0
@@ -72,6 +74,55 @@ process_thermal_images <- function(input_dir, output_dir, methods = "all") {
     matrix(colors[floor(normalized * 255) + 1], nrow = nrow(img))
   }
   
+  # Define specification-based histogram matching function
+  match_to_specification <- function(source_img, ref_mean, ref_std, num_bins = 256) {
+    # Normalize source to [0,1]
+    src_min <- min(source_img)
+    src_max <- max(source_img)
+    src_norm <- (source_img - src_min) / (src_max - src_min)
+    
+    # Create target Gaussian distribution based on reference statistics
+    x <- seq(0, 1, length.out = num_bins)
+    target_hist <- dnorm(x, mean = 0.5, sd = 0.2)
+    target_hist <- target_hist / sum(target_hist)
+    target_cdf <- cumsum(target_hist)
+    
+    # Calculate source histogram and CDF
+    src_hist <- hist(src_norm, breaks = seq(0, 1, length.out = num_bins + 1), plot = FALSE)
+    src_cdf <- cumsum(src_hist$counts) / sum(src_hist$counts)
+    
+    # Create lookup table
+    lookup <- numeric(num_bins)
+    for (i in 1:num_bins) {
+      if (i <= length(src_cdf)) {
+        # Find closest value in target CDF
+        diff <- abs(target_cdf - src_cdf[i])
+        closest <- which.min(diff)
+        lookup[i] <- x[closest]
+      }
+    }
+    
+    # Apply lookup table
+    result <- source_img
+    for (i in 1:length(source_img)) {
+      # Scale value to bin index
+      bin <- floor(num_bins * (source_img[i] - src_min) / (src_max - src_min)) + 1
+      bin <- min(max(bin, 1), num_bins)
+      
+      # Apply mapping and scale back to original range
+      norm_val <- lookup[bin]
+      result[i] <- norm_val * (src_max - src_min) + src_min
+    }
+    
+    # Scale the result to match reference statistics
+    result_std <- sd(result)
+    result_mean <- mean(result)
+    result <- (result - result_mean) * (ref_std/result_std) + ref_mean
+    
+    return(result)
+  }
+  
+  # Helper functions for other methods
   apply_msr <- function(img, scales = c(2, 4, 8)) {
     result <- matrix(0, nrow = nrow(img), ncol = ncol(img))
     img_norm <- (img - min(img)) / (max(img) - min(img))
@@ -152,7 +203,8 @@ process_thermal_images <- function(input_dir, output_dir, methods = "all") {
   # Process each image with all methods
   all_results <- list()
   reference_img <- NULL
-  hist_breaks <- seq(global_min, global_max, length.out = 100)
+  ref_mean <- NULL
+  ref_std <- NULL
   
   for (i in seq_along(tiff_files)) {
     img_path <- tiff_files[i]
@@ -160,40 +212,35 @@ process_thermal_images <- function(input_dir, output_dir, methods = "all") {
     cat("Processing:", base_name, "\n")
     
     tryCatch({
-      curr_img <- readTIFF(img_path, all = TRUE)[[1]]
+      curr_img <- readTIFF(img_path, all = TRUE, native = TRUE)[[1]]
       if (any(is.na(curr_img))) curr_img[is.na(curr_img)] <- global_min
       
       results <- list()
       results$original <- curr_img
       
-      # Sequential Histogram Matching
+      # Histogram Matching using specification-based approach
       if ("hist_matched" %in% selected_methods) {
-        if (is.null(reference_img)) {
+        if (i == 1) {
+          # Store reference statistics from first image
           reference_img <- curr_img
+          ref_mean <- mean(reference_img)
+          ref_std <- sd(reference_img)
           results$hist_matched <- curr_img
         } else {
-          ref_hist <- hist(reference_img, breaks = hist_breaks, plot = FALSE)
-          ref_cdf <- cumsum(ref_hist$counts) / sum(ref_hist$counts)
-          
-          src_hist <- hist(curr_img, breaks = hist_breaks, plot = FALSE)
-          src_cdf <- cumsum(src_hist$counts) / sum(src_hist$counts)
-          
-          matched_img <- curr_img
-          for (j in 1:length(curr_img)) {
-            bin <- findInterval(curr_img[j], hist_breaks)
-            if (bin > 0 && bin <= length(src_cdf)) {
-              target_cdf <- src_cdf[bin]
-              new_bin <- which.min(abs(ref_cdf - target_cdf))
-              matched_img[j] <- hist_breaks[new_bin]
-            }
-          }
-          results$hist_matched <- matched_img
-          reference_img <- matched_img
+          # Match to specification based on reference statistics
+          results$hist_matched <- match_to_specification(curr_img, ref_mean, ref_std)
         }
+        
+        # Ensure values stay within global range
+        results$hist_matched <- pmin(pmax(results$hist_matched, global_min), global_max)
+        
         # Save histogram matched image
         writeTIFF(results$hist_matched, 
                   file.path(output_dir, "processed", "hist_matched", 
-                            paste0(base_name, "_hist_matched.tiff")))
+                            paste0(base_name, "_hist_matched.tiff")),
+                  bits.per.sample = 16,
+                  compression = "none",
+                  native = TRUE)
       }
       
       # CLAHE
@@ -201,39 +248,55 @@ process_thermal_images <- function(input_dir, output_dir, methods = "all") {
         scaled_img <- (curr_img - global_min) / (global_max - global_min)
         img_eb <- Image(scaled_img)
         clahe_img <- clahe(img_eb)
-        results$clahe <- as.array(clahe_img) * (global_max - global_min) + global_min
-        # Save CLAHE image
+        results$clahe <- matrix(as.array(clahe_img) * (global_max - global_min) + global_min,
+                                nrow = nrow(curr_img), 
+                                ncol = ncol(curr_img))
         writeTIFF(results$clahe, 
                   file.path(output_dir, "processed", "clahe", 
-                            paste0(base_name, "_clahe.tiff")))
+                            paste0(base_name, "_clahe.tiff")),
+                  bits.per.sample = 16,
+                  compression = "none",
+                  native = TRUE)
       }
       
       # MSR
       if ("msr" %in% selected_methods) {
-        results$msr <- apply_msr(curr_img)
-        # Save MSR image
+        results$msr <- matrix(apply_msr(curr_img),
+                              nrow = nrow(curr_img), 
+                              ncol = ncol(curr_img))
         writeTIFF(results$msr, 
                   file.path(output_dir, "processed", "msr", 
-                            paste0(base_name, "_msr.tiff")))
+                            paste0(base_name, "_msr.tiff")),
+                  bits.per.sample = 16,
+                  compression = "none",
+                  native = TRUE)
       }
       
       # Bilateral
       if ("bilateral" %in% selected_methods) {
         cat("Applying bilateral filter...\n")
-        results$bilateral <- apply_bilateral(curr_img)
-        # Save bilateral filtered image
+        results$bilateral <- matrix(apply_bilateral(curr_img),
+                                    nrow = nrow(curr_img), 
+                                    ncol = ncol(curr_img))
         writeTIFF(results$bilateral, 
                   file.path(output_dir, "processed", "bilateral", 
-                            paste0(base_name, "_bilateral.tiff")))
+                            paste0(base_name, "_bilateral.tiff")),
+                  bits.per.sample = 16,
+                  compression = "none",
+                  native = TRUE)
       }
       
       # LCEP
       if ("lcep" %in% selected_methods) {
-        results$lcep <- apply_lcep(curr_img)
-        # Save LCEP image
+        results$lcep <- matrix(apply_lcep(curr_img),
+                               nrow = nrow(curr_img), 
+                               ncol = ncol(curr_img))
         writeTIFF(results$lcep, 
                   file.path(output_dir, "processed", "lcep", 
-                            paste0(base_name, "_lcep.tiff")))
+                            paste0(base_name, "_lcep.tiff")),
+                  bits.per.sample = 16,
+                  compression = "none",
+                  native = TRUE)
       }
       
       all_results[[i]] <- results
@@ -273,8 +336,6 @@ process_thermal_images <- function(input_dir, output_dir, methods = "all") {
   cat("Processed images saved in:", file.path(output_dir, "processed"), "\n")
   cat("Comparison visualization saved in:", file.path(output_dir, "comparisons"), "\n")
 }
-
-process_thermal_images("./images", "./processed_images")
 
 # Example usage:
 # All methods:
