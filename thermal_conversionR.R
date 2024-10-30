@@ -1,6 +1,5 @@
 library(tiff)
 library(EBImage)
-library(OpenImageR)
 library(grid)
 
 process_thermal_images <- function(input_dir, output_dir, methods = "all") {
@@ -55,17 +54,16 @@ process_thermal_images <- function(input_dir, output_dir, methods = "all") {
   sapply(file.path(output_dir, "processed", method_dirs), 
          dir.create, recursive = TRUE, showWarnings = FALSE)
   
-  # Calculate global min/max with proper handling of signed integers
+  # Calculate global min/max
   all_mins <- all_maxs <- numeric(length(tiff_files))
   for (i in seq_along(tiff_files)) {
-    img <- readTIFF(tiff_files[i], all = TRUE, native = TRUE)[[1]]
+    img <- readTIFF(tiff_files[i], all = TRUE)[[1]]
     all_mins[i] <- min(img, na.rm = TRUE)
     all_maxs[i] <- max(img, na.rm = TRUE)
   }
   global_min <- min(all_mins)
   global_max <- max(all_maxs)
   
-  # Helper function for thermal colorization
   colorize_thermal <- function(img) {
     normalized <- (img - global_min) / (global_max - global_min)
     normalized[normalized < 0] <- 0
@@ -74,30 +72,6 @@ process_thermal_images <- function(input_dir, output_dir, methods = "all") {
     matrix(colors[floor(normalized * 255) + 1], nrow = nrow(img))
   }
   
-  match_percentile_based <- function(source_img, reference_img) {
-    # Normalize both images to [0,1] range
-    src_norm <- (source_img - min(source_img)) / (diff(range(source_img)))
-    ref_norm <- (reference_img - min(reference_img)) / (diff(range(reference_img)))
-    
-    # Calculate percentiles on normalized images
-    ref_percentiles <- quantile(ref_norm, probs = seq(0, 1, 0.01))
-    src_percentiles <- quantile(src_norm, probs = seq(0, 1, 0.01))
-    
-    # Map normalized source to normalized reference
-    result_norm <- src_norm
-    for(i in 1:length(src_norm)) {
-      bin <- findInterval(src_norm[i], src_percentiles)
-      bin <- min(max(bin, 1), length(ref_percentiles))
-      result_norm[i] <- ref_percentiles[bin]
-    }
-    
-    # Scale back to source range
-    result <- result_norm * diff(range(source_img)) + min(source_img)
-    
-    return(result)
-  }
-  
-  # Helper functions for other methods
   apply_msr <- function(img, scales = c(2, 4, 8)) {
     result <- matrix(0, nrow = nrow(img), ncol = ncol(img))
     img_norm <- (img - min(img)) / (max(img) - min(img))
@@ -178,15 +152,7 @@ process_thermal_images <- function(input_dir, output_dir, methods = "all") {
   # Process each image with all methods
   all_results <- list()
   reference_img <- NULL
-  ref_mean <- NULL
-  ref_std <- NULL
-  
-  # Track median values
-  median_values <- data.frame(
-    frame = integer(),
-    original = numeric(),
-    matched = numeric()
-  )
+  hist_breaks <- seq(global_min, global_max, length.out = 100)
   
   for (i in seq_along(tiff_files)) {
     img_path <- tiff_files[i]
@@ -194,41 +160,51 @@ process_thermal_images <- function(input_dir, output_dir, methods = "all") {
     cat("Processing:", base_name, "\n")
     
     tryCatch({
-      curr_img <- readTIFF(img_path, all = TRUE, native = TRUE)[[1]]
+      curr_img <- readTIFF(img_path, all = TRUE)[[1]]
       if (any(is.na(curr_img))) curr_img[is.na(curr_img)] <- global_min
       
       results <- list()
       results$original <- curr_img
       
-      # Histogram Matching using percentile-based approach
+      # Histogram Matching (using first image as constant reference)
       if ("hist_matched" %in% selected_methods) {
         if (i == 1) {
-          # Store first image as reference
+          # Store first image as permanent reference
           reference_img <- curr_img
+          reference_hist <- hist(reference_img, breaks = hist_breaks, plot = FALSE)
+          reference_cdf <- cumsum(reference_hist$counts) / sum(reference_hist$counts)
           results$hist_matched <- curr_img
         } else {
-          # Match to first image using percentile matching
-          results$hist_matched <- match_percentile_based(curr_img, reference_img)
+          # Match to the first image's histogram
+          src_hist <- hist(curr_img, breaks = hist_breaks, plot = FALSE)
+          src_cdf <- cumsum(src_hist$counts) / sum(src_hist$counts)
+          
+          # Create lookup table for matching
+          lookup <- numeric(length(hist_breaks) - 1)
+          for (j in 1:length(lookup)) {
+            lookup[j] <- hist_breaks[which.min(abs(reference_cdf - src_cdf[j]))]
+          }
+          
+          # Apply lookup table to current image
+          matched_img <- matrix(curr_img, nrow = nrow(curr_img), ncol = ncol(curr_img))
+          for (j in 1:length(curr_img)) {
+            bin <- findInterval(curr_img[j], hist_breaks)
+            if (bin > 0 && bin <= length(lookup)) {
+              matched_img[j] <- lookup[bin]
+            }
+          }
+          
+          results$hist_matched <- matched_img
         }
         
-        # Track median values for this frame
-        median_values <- rbind(median_values, 
-                               data.frame(
-                                 frame = i,
-                                 original = median(curr_img),
-                                 matched = median(results$hist_matched)
-                               ))
-        
-        # Save histogram matched image
-        writeTIFF(matrix(results$hist_matched, nrow=nrow(curr_img)),
+        # Save histogram matched image with original dimensions
+        writeTIFF(results$hist_matched, 
                   file.path(output_dir, "processed", "hist_matched", 
                             paste0(base_name, "_hist_matched.tiff")),
                   bits.per.sample = 16,
-                  compression = "none",
-                  native = TRUE)
+                  compression = "none")
       }
       
-      # CLAHE
       if ("clahe" %in% selected_methods) {
         scaled_img <- (curr_img - global_min) / (global_max - global_min)
         img_eb <- Image(scaled_img)
@@ -240,8 +216,7 @@ process_thermal_images <- function(input_dir, output_dir, methods = "all") {
                   file.path(output_dir, "processed", "clahe", 
                             paste0(base_name, "_clahe.tiff")),
                   bits.per.sample = 16,
-                  compression = "none",
-                  native = TRUE)
+                  compression = "none")
       }
       
       # MSR
@@ -253,8 +228,7 @@ process_thermal_images <- function(input_dir, output_dir, methods = "all") {
                   file.path(output_dir, "processed", "msr", 
                             paste0(base_name, "_msr.tiff")),
                   bits.per.sample = 16,
-                  compression = "none",
-                  native = TRUE)
+                  compression = "none")
       }
       
       # Bilateral
@@ -267,8 +241,7 @@ process_thermal_images <- function(input_dir, output_dir, methods = "all") {
                   file.path(output_dir, "processed", "bilateral", 
                             paste0(base_name, "_bilateral.tiff")),
                   bits.per.sample = 16,
-                  compression = "none",
-                  native = TRUE)
+                  compression = "none")
       }
       
       # LCEP
@@ -280,8 +253,7 @@ process_thermal_images <- function(input_dir, output_dir, methods = "all") {
                   file.path(output_dir, "processed", "lcep", 
                             paste0(base_name, "_lcep.tiff")),
                   bits.per.sample = 16,
-                  compression = "none",
-                  native = TRUE)
+                  compression = "none")
       }
       
       all_results[[i]] <- results
@@ -291,25 +263,6 @@ process_thermal_images <- function(input_dir, output_dir, methods = "all") {
       print(e)
     })
   }
-  
-  # Create median value plot
-  png(file.path(output_dir, "comparisons", "median_values.png"),
-      width = 800, height = 400)
-  
-  plot(median_values$frame, median_values$original, 
-       type = "l", col = "blue", 
-       xlab = "Frame Number", ylab = "Median Temperature",
-       main = "Median Temperature Values Across Frames",
-       ylim = range(c(median_values$original, median_values$matched)))
-  
-  lines(median_values$frame, median_values$matched, col = "red")
-  
-  legend("topright", 
-         legend = c("Original", "Histogram Matched"),
-         col = c("blue", "red"),
-         lty = 1)
-  
-  dev.off()
   
   # Create visualization
   n_images <- length(tiff_files)
