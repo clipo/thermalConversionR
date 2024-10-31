@@ -1,6 +1,7 @@
 # Thermal Image Calibration Tools
 
 A comprehensive R toolkit for calibrating and processing thermal camera images using various enhancement and calibration techniques.
+![Example of image processing comparisons](methods_comparison.png)
 
 ## Features
 
