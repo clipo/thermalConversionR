@@ -19,6 +19,23 @@ A comprehensive R toolkit for calibrating and processing thermal camera images u
   * Guided Filtering
   * Wavelet-based Fusion
   * Local Histogram Equalization
+ 
+## Metadata Preservation with ExifTool
+To ensure that the original metadata and EXIF headers are retained in the processed output files, this script integrates with `exiftool`.
+
+### Installing ExifTool
+- **Linux/Unix**: Install via your package manager (e.g., `sudo apt-get install exiftool`).
+- **Windows**: Download and install ExifTool from the [official website](https://exiftool.org/).
+- **macOS**: Use Homebrew to install: `brew install exiftool`.
+
+### Ensuring ExifTool is Accessible
+- Verify the installation by running:
+  ```bash
+  exiftool -ver
+
+ If exiftool is not recognized, add it to your system’s PATH:
+	- **Linux/Unix:** Add export PATH=$PATH:/path/to/exiftool to ~/.bashrc or ~/.zshrc.
+	- **Windows:** Add the path to exiftool in Environment Variables under System Properties.
 
 ## Prerequisites
 
