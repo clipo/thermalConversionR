@@ -7,6 +7,11 @@ library(parallel)
 library(doParallel)
 library(stats)
 
+copy_metadata <- function(source_file, target_file) {
+  # This function copies metadata from the source image to the target image using exiftool
+  system(paste("exiftool -tagsFromFile", shQuote(source_file), "-all:all", shQuote(target_file), "-overwrite_original"))
+}
+
 process_thermal_images <- function(input_dir, output_dir, methods = "all", parallel = TRUE) {
   # Start time tracking
   start_time <- Sys.time()
@@ -929,6 +934,8 @@ process_thermal_images <- function(input_dir, output_dir, methods = "all", paral
         
         for(method in setdiff(selected_methods, "original")) {
           cat("Applying", method, "...\n")
+          processed_file_path <- file.path(output_dir, "processed", method, paste0(base_name, "_", method, ".tiff"))
+          
           results[[method]] <- switch(method,
                                       "hist_matched" = {
                                         if(i == 1) {
@@ -953,11 +960,11 @@ process_thermal_images <- function(input_dir, output_dir, methods = "all", paral
                                       "local_histogram" = apply_local_histogram(curr_img)
           )
           
-          writeTIFF(results[[method]], 
-                    file.path(output_dir, "processed", method, 
-                              paste0(base_name, "_", method, ".tiff")),
-                    bits.per.sample = 16,
-                    compression = "none")
+          # Write the processed image to disk
+          writeTIFF(results[[method]], processed_file_path, bits.per.sample = 16, compression = "none")
+          
+          # Copy metadata from the original image to the processed image
+          copy_metadata(img_path, processed_file_path)
         }
         
         all_results[[i]] <- results
